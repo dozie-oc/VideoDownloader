@@ -29,12 +29,20 @@ def sanitize_filename(name: str) -> str:
     return re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name)[:200]
 
 
+class CancelledError(Exception):
+    """Custom exception to abort downloads."""
+    pass
+
+
 def make_progress_hook(job_id: str):
     def hook(d):
         with jobs_lock:
             job = jobs.get(job_id)
             if job is None:
-                return
+                raise CancelledError("Job deleted")
+            if job.get("status") == "cancelled":
+                raise CancelledError("User cancelled download")
+
             if d["status"] == "downloading":
                 job["status"] = "downloading"
                 job["progress"] = d.get("_percent_str", "0%").strip()
@@ -50,14 +58,22 @@ def make_progress_hook(job_id: str):
     return hook
 
 
-def run_download(job_id: str, url: str, ydl_opts: dict):
+def run_download(job_id: str, url: str, ydl_opts: dict, cookie_file: str = None):
     """Execute yt-dlp download in a background thread."""
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
+        
+        # Check one last time if we were cancelled during finishing steps
+        with jobs_lock:
+            if jobs.get(job_id, {}).get("status") == "cancelled":
+                raise CancelledError("User cancelled download")
+
         # Find the actual output file
         job_dir = DOWNLOAD_DIR / job_id
         files = list(job_dir.iterdir()) if job_dir.exists() else []
+        # Exclude the temporary cookie file if it exists
+        files = [f for f in files if f.name != "cookies.txt"]
         if files:
             final = max(files, key=lambda f: f.stat().st_size)
             with jobs_lock:
@@ -69,14 +85,38 @@ def run_download(job_id: str, url: str, ydl_opts: dict):
             with jobs_lock:
                 jobs[job_id]["status"] = "error"
                 jobs[job_id]["error"]  = "No output file found after download."
-    except yt_dlp.utils.DownloadError as e:
+    except (yt_dlp.utils.DownloadError, CancelledError) as e:
         with jobs_lock:
-            jobs[job_id]["status"] = "error"
-            jobs[job_id]["error"]  = str(e)
+            # If it was cancelled, preserve the 'cancelled' status
+            if jobs.get(job_id, {}).get("status") == "cancelled":
+                pass
+            else:
+                jobs[job_id]["status"] = "error"
+                jobs[job_id]["error"]  = str(e)
+        # Clean up any partial downloads in the job directory
+        job_dir = DOWNLOAD_DIR / job_id
+        if job_dir.exists():
+            shutil.rmtree(job_dir, ignore_errors=True)
     except Exception as e:
         with jobs_lock:
-            jobs[job_id]["status"] = "error"
-            jobs[job_id]["error"]  = f"Unexpected error: {e}"
+            if jobs.get(job_id, {}).get("status") == "cancelled":
+                pass
+            else:
+                jobs[job_id]["status"] = "error"
+                jobs[job_id]["error"]  = f"Unexpected error: {e}"
+        # Clean up
+        job_dir = DOWNLOAD_DIR / job_id
+        if job_dir.exists():
+            shutil.rmtree(job_dir, ignore_errors=True)
+    finally:
+        # Clean up temporary cookie file if it was created for this thread
+        if cookie_file and os.path.exists(cookie_file):
+            try:
+                os.unlink(cookie_file)
+            except Exception:
+                pass
+
+
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
@@ -91,6 +131,7 @@ def api_info():
     """Fetch video metadata (title, thumbnail, formats) without downloading."""
     data = request.get_json(force=True)
     url  = (data.get("url") or "").strip()
+    cookies_text = (data.get("cookies") or "").strip()
     if not url:
         return jsonify({"error": "No URL provided"}), 400
 
@@ -101,6 +142,15 @@ def api_info():
         "noplaylist": True,
     }
 
+    cookie_file_path = None
+    if cookies_text:
+        # Generate a temporary cookies file
+        temp_id = str(uuid.uuid4())
+        cookie_file_path = DOWNLOAD_DIR / f"cookies_{temp_id}.txt"
+        with open(cookie_file_path, "w", encoding="utf-8") as f:
+            f.write(cookies_text)
+        ydl_opts["cookiefile"] = str(cookie_file_path)
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -108,6 +158,13 @@ def api_info():
         return jsonify({"error": str(e)}), 422
     except Exception as e:
         return jsonify({"error": f"Failed to fetch info: {e}"}), 500
+    finally:
+        # Clean up info temp cookie file immediately
+        if cookie_file_path and cookie_file_path.exists():
+            try:
+                cookie_file_path.unlink()
+            except Exception:
+                pass
 
     # Build format list (deduplicated, human-readable)
     formats_raw = info.get("formats") or []
@@ -176,6 +233,7 @@ def api_download():
     data      = request.get_json(force=True)
     url       = (data.get("url") or "").strip()
     format_id = (data.get("format_id") or "best").strip()
+    cookies_text = (data.get("cookies") or "").strip()
 
     if not url:
         return jsonify({"error": "No URL provided"}), 400
@@ -205,6 +263,14 @@ def api_download():
         "ignoreerrors":     False,
     }
 
+    # Write cookies to job directory if provided
+    cookie_file_path = None
+    if cookies_text:
+        cookie_file_path = job_dir / "cookies.txt"
+        with open(cookie_file_path, "w", encoding="utf-8") as f:
+            f.write(cookies_text)
+        ydl_opts["cookiefile"] = str(cookie_file_path)
+
     # Audio-only: convert to mp3
     if "bestaudio" in format_id and "video" not in format_id:
         ydl_opts["postprocessors"].insert(0, {
@@ -227,7 +293,11 @@ def api_download():
             "url":      url,
         }
 
-    thread = threading.Thread(target=run_download, args=(job_id, url, ydl_opts), daemon=True)
+    thread = threading.Thread(
+        target=run_download, 
+        args=(job_id, url, ydl_opts, str(cookie_file_path) if cookie_file_path else None), 
+        daemon=True
+    )
     thread.start()
 
     return jsonify({"job_id": job_id})
@@ -326,6 +396,18 @@ def api_history():
             for jid, j in jobs.items()
         ]
     return jsonify(result[::-1])  # newest first
+
+
+@app.route("/api/cancel/<job_id>", methods=["POST"])
+def api_cancel(job_id: str):
+    """Mark a job as cancelled to stop the active thread."""
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if job:
+            job["status"] = "cancelled"
+            job["percent"] = 0
+            job["progress"] = "Cancelled"
+    return jsonify({"ok": True})
 
 
 @app.route("/api/delete/<job_id>", methods=["DELETE"])
