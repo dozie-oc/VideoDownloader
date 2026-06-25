@@ -140,6 +140,7 @@ def api_info():
         "no_warnings": True,
         "skip_download": True,
         "noplaylist": True,
+        "nocheckcertificate": True,  # Fixes local SSL certificate verify failed issues
         "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "http_headers": {
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
@@ -150,7 +151,8 @@ def api_info():
         },
         "extractor_args": {
             "youtube": {
-                "player_client": ["android", "ios", "web"],
+                # Use tv and creator clients which bypass IP-cookie matching bans
+                "player_client": ["tv", "web_creator", "android", "ios", "web"],
                 "skip": ["webpage"]
             }
         }
@@ -164,6 +166,13 @@ def api_info():
         with open(cookie_file_path, "w", encoding="utf-8") as f:
             f.write(cookies_text)
         ydl_opts["cookiefile"] = str(cookie_file_path)
+    else:
+        # If running locally (on localhost/127.0.0.1) and no manual cookies are provided,
+        # automatically grab cookies from the user's browser to make it seamless!
+        is_local = any(h in request.host for h in ["localhost", "127.0.0.1", "10.11.116"])
+        if is_local:
+            # We try Chrome first, fallback to Edge/Firefox
+            ydl_opts["cookiesfrombrowser"] = ("chrome", "edge", "firefox", "safari")
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -263,6 +272,7 @@ def api_download():
         "quiet":            True,
         "no_warnings":      True,
         "noplaylist":       True,
+        "nocheckcertificate": True,  # Fixes local SSL certificate verify failed issues
         "merge_output_format": "mp4",
         "progress_hooks":   [make_progress_hook(job_id)],
         "postprocessors": [
@@ -281,7 +291,8 @@ def api_download():
         },
         "extractor_args": {
             "youtube": {
-                "player_client": ["android", "ios", "web"],
+                # Use tv and creator clients which bypass IP-cookie matching bans
+                "player_client": ["tv", "web_creator", "android", "ios", "web"],
                 "skip": ["webpage"]
             }
         },
@@ -298,6 +309,11 @@ def api_download():
         with open(cookie_file_path, "w", encoding="utf-8") as f:
             f.write(cookies_text)
         ydl_opts["cookiefile"] = str(cookie_file_path)
+    else:
+        # If running locally and no manual cookies provided, auto-grab from browser
+        is_local = any(h in request.host for h in ["localhost", "127.0.0.1", "10.11.116"])
+        if is_local:
+            ydl_opts["cookiesfrombrowser"] = ("chrome", "edge", "firefox", "safari")
 
     # Audio-only: convert to mp3
     if "bestaudio" in format_id and "video" not in format_id:
