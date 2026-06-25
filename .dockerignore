@@ -1,0 +1,10 @@
+# Ignore local downloads and temporary folders
+downloads/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.git/
+.github/
+.gitignore
+start.bat

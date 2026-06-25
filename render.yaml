@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: vdownloader
+    env: docker
+    plan: free # Can be upgraded if you need more build time/RAM
+    region: oregon
+    envVars:
+      - key: PORT
+        value: 7878

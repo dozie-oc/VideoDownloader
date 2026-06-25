@@ -1,0 +1,353 @@
+import os
+import uuid
+import json
+import time
+import threading
+import re
+import shutil
+from pathlib import Path
+from flask import Flask, request, jsonify, send_file, Response, render_template, stream_with_context
+from flask_cors import CORS
+import yt_dlp
+
+app = Flask(__name__)
+CORS(app)
+
+# ── Configuration ──────────────────────────────────────────────────────────────
+BASE_DIR = Path(__file__).parent
+DOWNLOAD_DIR = BASE_DIR / "downloads"
+DOWNLOAD_DIR.mkdir(exist_ok=True)
+
+# In-memory job store  { job_id: { status, progress, speed, eta, filename, error, title, url } }
+jobs: dict[str, dict] = {}
+jobs_lock = threading.Lock()
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def sanitize_filename(name: str) -> str:
+    """Remove characters that are unsafe in filenames."""
+    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name)[:200]
+
+
+def make_progress_hook(job_id: str):
+    def hook(d):
+        with jobs_lock:
+            job = jobs.get(job_id)
+            if job is None:
+                return
+            if d["status"] == "downloading":
+                job["status"] = "downloading"
+                job["progress"] = d.get("_percent_str", "0%").strip()
+                job["speed"]    = d.get("_speed_str", "").strip()
+                job["eta"]      = d.get("_eta_str", "").strip()
+                raw = d.get("downloaded_bytes", 0)
+                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 1
+                job["percent"]  = round((raw / total) * 100, 1)
+            elif d["status"] == "finished":
+                job["status"]   = "merging"
+                job["percent"]  = 99
+                job["filename"] = d.get("filename", "")
+    return hook
+
+
+def run_download(job_id: str, url: str, ydl_opts: dict):
+    """Execute yt-dlp download in a background thread."""
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+        # Find the actual output file
+        job_dir = DOWNLOAD_DIR / job_id
+        files = list(job_dir.iterdir()) if job_dir.exists() else []
+        if files:
+            final = max(files, key=lambda f: f.stat().st_size)
+            with jobs_lock:
+                jobs[job_id]["filename"]  = str(final)
+                jobs[job_id]["basename"]  = final.name
+                jobs[job_id]["status"]    = "done"
+                jobs[job_id]["percent"]   = 100
+        else:
+            with jobs_lock:
+                jobs[job_id]["status"] = "error"
+                jobs[job_id]["error"]  = "No output file found after download."
+    except yt_dlp.utils.DownloadError as e:
+        with jobs_lock:
+            jobs[job_id]["status"] = "error"
+            jobs[job_id]["error"]  = str(e)
+    except Exception as e:
+        with jobs_lock:
+            jobs[job_id]["status"] = "error"
+            jobs[job_id]["error"]  = f"Unexpected error: {e}"
+
+
+# ── Routes ─────────────────────────────────────────────────────────────────────
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+@app.route("/api/info", methods=["POST"])
+def api_info():
+    """Fetch video metadata (title, thumbnail, formats) without downloading."""
+    data = request.get_json(force=True)
+    url  = (data.get("url") or "").strip()
+    if not url:
+        return jsonify({"error": "No URL provided"}), 400
+
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True,
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except yt_dlp.utils.DownloadError as e:
+        return jsonify({"error": str(e)}), 422
+    except Exception as e:
+        return jsonify({"error": f"Failed to fetch info: {e}"}), 500
+
+    # Build format list (deduplicated, human-readable)
+    formats_raw = info.get("formats") or []
+    seen = set()
+    formats = []
+
+    # Best combined option always first
+    formats.append({"id": "best", "label": "⭐ Best Quality (auto)", "ext": "mp4"})
+    formats.append({"id": "bestvideo+bestaudio/best", "label": "🎬 Best Video + Best Audio", "ext": "mp4"})
+
+    for f in reversed(formats_raw):  # highest quality last → reversed = best first
+        vcodec = f.get("vcodec", "none")
+        acodec = f.get("acodec", "none")
+        height  = f.get("height")
+        fps     = f.get("fps")
+        ext     = f.get("ext", "?")
+        fid     = f.get("format_id", "")
+        tbr     = f.get("tbr")
+
+        if vcodec == "none" and acodec == "none":
+            continue
+
+        if vcodec != "none" and height:
+            key = (height, ext)
+            if key in seen:
+                continue
+            seen.add(key)
+            fps_str = f" {int(fps)}fps" if fps and fps > 30 else ""
+            tbr_str = f" ~{int(tbr)}k" if tbr else ""
+            formats.append({
+                "id":    fid,
+                "label": f"🎥 {height}p{fps_str} ({ext}){tbr_str}",
+                "ext":   ext,
+            })
+        elif vcodec == "none" and acodec != "none":
+            key = ("audio", ext)
+            if key in seen:
+                continue
+            seen.add(key)
+            abr = f.get("abr")
+            abr_str = f" {int(abr)}kbps" if abr else ""
+            formats.append({
+                "id":    fid,
+                "label": f"🎵 Audio only ({ext}){abr_str}",
+                "ext":   ext,
+            })
+
+    # Also add common audio-only presets
+    formats.append({"id": "bestaudio[ext=m4a]/bestaudio", "label": "🎵 Best Audio (m4a)", "ext": "m4a"})
+    formats.append({"id": "bestaudio", "label": "🎵 Best Audio (any)", "ext": "webm"})
+
+    return jsonify({
+        "title":      info.get("title", "Unknown"),
+        "channel":    info.get("uploader") or info.get("channel", ""),
+        "duration":   info.get("duration"),
+        "thumbnail":  info.get("thumbnail"),
+        "webpage_url": info.get("webpage_url", url),
+        "extractor":  info.get("extractor_key", ""),
+        "formats":    formats,
+    })
+
+
+@app.route("/api/download", methods=["POST"])
+def api_download():
+    """Start a download job and return a job_id."""
+    data      = request.get_json(force=True)
+    url       = (data.get("url") or "").strip()
+    format_id = (data.get("format_id") or "best").strip()
+
+    if not url:
+        return jsonify({"error": "No URL provided"}), 400
+
+    job_id  = str(uuid.uuid4())
+    job_dir = DOWNLOAD_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    # Build yt-dlp options
+    ydl_opts: dict = {
+        "format":           format_id,
+        "outtmpl":          str(job_dir / "%(title)s.%(ext)s"),
+        "quiet":            True,
+        "no_warnings":      True,
+        "noplaylist":       True,
+        "merge_output_format": "mp4",
+        "progress_hooks":   [make_progress_hook(job_id)],
+        "postprocessors": [
+            {
+                "key":            "FFmpegMetadata",
+                "add_metadata":   True,
+            }
+        ],
+        # Retries / resilience
+        "retries":          5,
+        "fragment_retries": 10,
+        "ignoreerrors":     False,
+    }
+
+    # Audio-only: convert to mp3
+    if "bestaudio" in format_id and "video" not in format_id:
+        ydl_opts["postprocessors"].insert(0, {
+            "key":            "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
+        })
+        ydl_opts["outtmpl"] = str(job_dir / "%(title)s.%(ext)s")
+
+    with jobs_lock:
+        jobs[job_id] = {
+            "status":   "queued",
+            "percent":  0,
+            "progress": "0%",
+            "speed":    "",
+            "eta":      "",
+            "filename": "",
+            "basename": "",
+            "error":    "",
+            "url":      url,
+        }
+
+    thread = threading.Thread(target=run_download, args=(job_id, url, ydl_opts), daemon=True)
+    thread.start()
+
+    return jsonify({"job_id": job_id})
+
+
+@app.route("/api/progress/<job_id>")
+def api_progress(job_id: str):
+    """Server-Sent Events stream for real-time progress updates."""
+    def generate():
+        while True:
+            with jobs_lock:
+                job = jobs.get(job_id)
+            if job is None:
+                yield f"data: {json.dumps({'error': 'Job not found'})}\n\n"
+                break
+            payload = json.dumps({
+                "status":   job["status"],
+                "percent":  job["percent"],
+                "progress": job["progress"],
+                "speed":    job["speed"],
+                "eta":      job["eta"],
+                "basename": job["basename"],
+                "error":    job["error"],
+            })
+            yield f"data: {payload}\n\n"
+            if job["status"] in ("done", "error"):
+                break
+            time.sleep(0.5)
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.route("/api/file/<job_id>")
+def api_file(job_id: str):
+    """Serve the downloaded file for browser download and clean it up immediately after."""
+    with jobs_lock:
+        job = jobs.get(job_id)
+
+    if not job or job["status"] != "done":
+        return jsonify({"error": "File not ready or job not found"}), 404
+
+    filepath = Path(job["filename"])
+    if not filepath.exists():
+        return jsonify({"error": "File missing on disk"}), 404
+
+    # We read the file, and delete it once the transfer finishes
+    def stream_and_remove():
+        try:
+            with open(filepath, "rb") as f:
+                yield from f
+        finally:
+            # Clean up the file and its job directory after streaming is complete
+            try:
+                if filepath.exists():
+                    filepath.unlink()
+                job_dir = filepath.parent
+                if job_dir.exists() and job_dir != DOWNLOAD_DIR:
+                    shutil.rmtree(job_dir, ignore_errors=True)
+            except Exception as e:
+                app.logger.error(f"Error cleaning up file: {e}")
+
+    # Remove the job from the active jobs list so it doesn't show up as downloadable anymore
+    with jobs_lock:
+        if job_id in jobs:
+            jobs[job_id]["status"] = "cleaned"
+
+    return Response(
+        stream_and_remove(),
+        headers={
+            "Content-Disposition": f'attachment; filename="{filepath.name}"',
+            "Content-Type": "application/octet-stream"
+        }
+    )
+
+
+
+@app.route("/api/history")
+def api_history():
+    """Return list of completed/errored jobs."""
+    with jobs_lock:
+        result = [
+            {
+                "job_id":   jid,
+                "status":   j["status"],
+                "basename": j["basename"],
+                "url":      j["url"],
+                "error":    j["error"],
+            }
+            for jid, j in jobs.items()
+        ]
+    return jsonify(result[::-1])  # newest first
+
+
+@app.route("/api/delete/<job_id>", methods=["DELETE"])
+def api_delete(job_id: str):
+    """Delete a job and its downloaded files."""
+    with jobs_lock:
+        jobs.pop(job_id, None)
+    job_dir = DOWNLOAD_DIR / job_id
+    if job_dir.exists():
+        shutil.rmtree(job_dir, ignore_errors=True)
+    return jsonify({"ok": True})
+
+
+if __name__ == "__main__":
+    import webbrowser
+    # Ensure we always run from the directory containing app.py
+    os.chdir(BASE_DIR)
+    PORT = 7878
+    print("\n" + "="*55)
+    print("  VDownloader  --  Local Video Downloader")
+    print(f"  Running at:  http://localhost:{PORT}")
+    print("="*55 + "\n")
+    threading.Timer(1.5, lambda: webbrowser.open(f"http://localhost:{PORT}")).start()
+    app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
+
