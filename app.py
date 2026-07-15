@@ -29,6 +29,25 @@ def sanitize_filename(name: str) -> str:
     return re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name)[:200]
 
 
+def is_twitter_url(url: str) -> bool:
+    """Check if URL is a Twitter/X post."""
+    return bool(re.search(r'(twitter\.com|x\.com)/\w+/status/', url))
+
+
+def get_twitter_alternatives(url: str) -> list:
+    """Generate alternative frontend URLs for Twitter/X videos.
+    
+    These frontends (fxtwitter, vxtwitter) act as proxies that
+    expose the video without requiring authentication.
+    """
+    alternatives = []
+    # Replace domain with alternative frontends
+    for alt_domain in ['fxtwitter.com', 'vxtwitter.com']:
+        alt = re.sub(r'(twitter\.com|x\.com)', alt_domain, url)
+        alternatives.append(alt)
+    return alternatives
+
+
 class CancelledError(Exception):
     """Custom exception to abort downloads."""
     pass
@@ -61,8 +80,29 @@ def make_progress_hook(job_id: str):
 def run_download(job_id: str, url: str, ydl_opts: dict, cookie_file: str = None):
     """Execute yt-dlp download in a background thread."""
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+        download_success = False
+        download_url = url
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+            download_success = True
+        except (yt_dlp.utils.DownloadError, Exception) as primary_err:
+            # For Twitter/X URLs, try alternative frontends before giving up
+            if is_twitter_url(url):
+                for alt_url in get_twitter_alternatives(url):
+                    try:
+                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                            ydl.download([alt_url])
+                        download_success = True
+                        download_url = alt_url
+                        break
+                    except Exception:
+                        continue
+                if not download_success:
+                    raise primary_err
+            else:
+                raise primary_err
         
         # Check one last time if we were cancelled during finishing steps
         with jobs_lock:
@@ -177,10 +217,34 @@ def api_info():
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-    except yt_dlp.utils.DownloadError as e:
-        return jsonify({"error": str(e)}), 422
-    except Exception as e:
-        return jsonify({"error": f"Failed to fetch info: {e}"}), 500
+        
+        # Check if Twitter returned empty formats ("no video found")
+        if is_twitter_url(url) and not info.get("formats"):
+            raise yt_dlp.utils.DownloadError("No video found in tweet, trying alternatives...")
+    except (yt_dlp.utils.DownloadError, Exception) as primary_err:
+        # For Twitter/X URLs, try alternative frontends before giving up
+        if is_twitter_url(url):
+            for alt_url in get_twitter_alternatives(url):
+                try:
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        info = ydl.extract_info(alt_url, download=False)
+                    if info and info.get("formats"):
+                        # Success! Override the URL to the working alternative
+                        info["original_url"] = url
+                        info["webpage_url"] = url  # Keep original for display
+                        break
+                except Exception:
+                    continue
+            else:
+                # All alternatives failed too
+                err_msg = str(primary_err)
+                if "no video" in err_msg.lower() or isinstance(primary_err, yt_dlp.utils.DownloadError):
+                    return jsonify({"error": f"Could not extract video from this tweet. Twitter may require login cookies — paste them in ⚙️ Settings. Original error: {err_msg}"}), 422
+                return jsonify({"error": f"Failed to fetch info: {err_msg}"}), 500
+        else:
+            if isinstance(primary_err, yt_dlp.utils.DownloadError):
+                return jsonify({"error": str(primary_err)}), 422
+            return jsonify({"error": f"Failed to fetch info: {primary_err}"}), 500
     finally:
         # Clean up info temp cookie file immediately
         if cookie_file_path and cookie_file_path.exists():
